@@ -1,0 +1,12 @@
+[package]
+name = "daily-commando"
+version = "0.1.0"
+edition = "2021"
+description = "A minimalist daily standup timer in commando style"
+license = "EUPL-1.2"
+repository = "https://github.com/robinsft/daily-commando"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9" }
+glib = "0.19"
+webkit2gtk = { version = "2.0", features = ["v2_40"] }
