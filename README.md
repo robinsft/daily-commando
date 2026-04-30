@@ -44,33 +44,40 @@ The 1-based index in front of each soldier **is** the speaking order.
 | `q` / `Esc`        | Abort the daily                   |
 
 > **There is no auto-advance.** When a soldier's allowance hits zero the timer
-> goes negative (red) and the boat physically *pushes* the next island —
-> the palm tree tilts more and more. The speaker who runs over is literally
-> stealing time from the rest of the team. Pressing `n` early earns *bonus
-> time* for the next speaker (the saved seconds are pooled forward).
+> goes negative (red) and the **boat keeps cruising at constant speed** —
+> the next island is visibly **towed two characters behind the boat** by an
+> anchor + rope until the user manually advances. The speaker who runs over
+> is literally dragging the next person across the ocean. Pressing `n` early
+> earns *bonus time* for the next speaker (saved seconds pool forward) and
+> plays a 5-frame anchor animation that **drags the next island TO the boat**
+> (the boat itself does not slow down).
 
 The display is a side-scroller:
 
 * a **big centered ASCII timer** counts down the current speaker's allowance,
   going **red and negative** on overshoot,
-* a **boat** (with a tiny soldier on deck) sails segment by segment between
-  N + 1 stops: `[start, island_1, …, island_{N-1}, castle]`,
-* each island has a **brown trunk + green canopy** palm and the next
-  waiting soldier; when pushed by an overshooting boat, the **palm tilts**
-  in 4 successive frames,
-* **early hand-over**: pressing `n` mid-segment plays a **5-frame anchor
-  animation** that drags the next island (or castle) to the boat,
+* a **boat** (with a tiny soldier on deck) sails at **constant cruise speed**
+  driven by `total_elapsed / total_budget`,
+* each island has a **brown trunk + green canopy** palm and the next waiting
+  soldier; islands sit still until either the user hands over early (anchor
+  pulls the island TO the boat) or the boat passes without pickup (a rope
+  tows the island 2 chars behind the boat),
 * the **font switches** to corrupt `ko` glyphs at 66 % of the allowance,
   alternates every tick in the last 5 s, and blinks every 0.5 s in overtime,
+* the renderer is **diff-based**: only changed cells are repainted, so the
+  big timer no longer flickers at 25 fps,
 * if the team **dock the castle in time**, a **Mario-style flag rises** on
   top of the castle with **4 fireworks** above it (easter egg) before the
   debrief screen,
 * if the team **fails** to dock before the global budget runs out, the boat
-  passes through the destroyed castle and **falls into an infinite cascade**.
-  The timer keeps counting **negative red**. At **2× the total budget** the
-  boat **crashes into Satan's throne** in hell. The mission report **does
-  not** appear automatically — you must press `q` / `Enter` / `Space` to end
-  the mission and reveal the debrief.
+  passes through the destroyed castle and **falls into the cascade**:
+    * `1× → 2×` total budget — boat falls through the void,
+    * `2× → 2.5×` — **Satan's face** appears at the bottom,
+    * `2.5× → 3×` — Satan reveals his **trident**,
+    * `≥ 3×` — **the boat crashes in hell**: screen turns red, flames
+      everywhere, debris on the floor.
+  The mission report **does not** appear automatically — press
+  `q` / `Enter` / `Space` at any time to end the mission and reveal the debrief.
 
 ## Architecture
 

@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! Landscape narrative engine — round 3.
+//! Landscape narrative engine — round 4.
 //!
-//! Three acts:
-//!   * **Voyage** — boat sails left → right across the ocean past N-1 islands
-//!     (each holding a waiting soldier under a tall palm tree), heading for
-//!     the castle on the right edge. The boat moves PER SEGMENT: while
-//!     soldier `i` is speaking, the boat travels from the previous stop to
-//!     the destination of soldier `i`. When `i` overshoots their allowance,
-//!     the boat is parked at the destination and visibly *pushes* the
-//!     palm — the palm tilts more and more.
-//!   * **Cascade** — the team failed to finish in time. Boat goes past the
-//!     destroyed castle and falls into an infinite waterfall.
-//!   * **Abyss** — at 2× total budget, Satan's throne reveals at the bottom.
+//! Boat motion: **constant cruise** driven by `total_elapsed / total_budget`.
+//! The boat's speed is fixed; what changes is what happens to islands.
 //!
-//! All decor is painted onto a char canvas; the big timer overlays on top.
-//! No I/O, no terminal calls — pure state + paint(canvas).
+//! - When the current speaker hands over EARLY (anchor pull animation), the
+//!   next island is dragged toward the boat. The boat does not slow down.
+//! - When the current speaker OVERRUNS, the boat sails right past the next
+//!   island. An anchor + rope tow that island to **2 cols behind the boat**
+//!   and drags it along until the user manually advances. The waiting
+//!   soldier sits on the towed island.
+//!
+//! Hell staging (driven by `total_elapsed / total_budget`):
+//!   * `< 1.0`           — Voyage (sun + sea).
+//!   * `1.0..2.0`        — Cascade: boat falls past castle into the void.
+//!   * `2.0..2.5`        — Satan's face appears at the bottom.
+//!   * `2.5..3.0`        — Satan's trident appears too.
+//!   * `>= 3.0`          — Full hell: boat crashes (debris), screen turns
+//!                          red, flames everywhere.
 
 use crossterm::style::Color;
 
@@ -23,27 +26,50 @@ pub struct WorldState {
     pub cols: usize,
     pub rows: usize,
     pub act: Act,
+    pub satan_stage: SatanStage,
     pub sun_x: usize,
     pub boat_x: usize,
-    pub boat_y: usize,           // top row of the (4-row) boat
-    pub boat_rotation: u8,       // 0..4, used in Cascade/Abyss
+    pub boat_y: usize,
+    pub boat_rotation: u8,
+    pub boat_wrecked: bool,
     pub horizon_y: usize,
-    pub stops: Vec<usize>,       // N+1 x-positions: [start, island_1, …, island_{N-1}, castle_dock]
-    pub palm_tilts: Vec<u8>,     // tilt 0..=3 for each of the N-1 islands
-    pub current_soldier: u32,    // 1-based
+    /// `N+1` original anchor x-positions: `[start, island_1, …, island_{N-1}, castle_dock]`.
+    pub stops: Vec<usize>,
+    /// Per-island state (length `N - 1`).
+    pub islands: Vec<IslandState>,
+    pub current_soldier: u32,
     pub soldiers: u32,
     pub castle_x: usize,
     pub castle_w: usize,
     pub castle_state: CastleState,
-    pub satan_revealed: bool,
     pub cascade_x: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Act { Voyage, Cascade, Abyss }
+pub enum Act { Voyage, Cascade, Hell }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SatanStage { None, Face, FaceTrident, FullHell }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastleState { Intact, Destroyed }
+
+/// Per-island visual state.
+#[derive(Debug, Clone, Copy)]
+pub struct IslandState {
+    /// Current x position (== original_x unless towed/pulled).
+    pub x: usize,
+    /// True when the boat has passed the island without picking up its
+    /// soldier — island is being towed by an anchor at `boat_x - 2`.
+    pub towed: bool,
+    /// True when the soldier has already boarded (island consumed → invisible).
+    pub consumed: bool,
+    /// True when an anchor-pull animation is running on this island; we draw
+    /// the rope but freeze it at `pull_x`.
+    pub pulling: bool,
+    /// Slight tilt 0..3 (only used while towed/pulling for visual feedback).
+    pub tilt: u8,
+}
 
 /// Inputs the TUI feeds us each frame.
 pub struct Inputs {
@@ -56,15 +82,23 @@ pub struct Inputs {
     pub cols: usize,
     pub rows: usize,
     pub elapsed_ms: u64,
-    /// True when the last soldier has gone past the global budget; triggers
-    /// the boat to leave the castle dock and fall into the cascade.
-    pub cascade_active: bool,
+    /// Override: current speaker has hit "next" early; the destination
+    /// island is being pulled toward the boat over `pull_progress` 0..1.
+    pub anchor_pull: Option<AnchorPull>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AnchorPull {
+    /// Stop index being pulled (1-based: 1..=N). `N` = castle.
+    pub stop_index: usize,
+    /// 0.0 = at original position, 1.0 = at boat.
+    pub progress: f32,
 }
 
 impl WorldState {
     pub fn compute(inp: &Inputs) -> Self {
-        let cols = inp.cols.max(20);
-        let rows = inp.rows.max(10);
+        let cols = inp.cols.max(40);
+        let rows = inp.rows.max(12);
         let budget = inp.total_budget.max(1);
 
         // ── Castle geometry ─────────────────────────────────────────
@@ -72,7 +106,6 @@ impl WorldState {
         let castle_x = cols.saturating_sub(castle_w + 2);
 
         // ── Stops: N+1 anchor x positions ──────────────────────────
-        // [0]=start dock (left), [1..N-1]=N-1 islands, [N]=castle dock.
         let n = inp.soldiers.max(1) as usize;
         let start_x: usize = 4;
         let castle_dock_x: usize = castle_x.saturating_sub(2);
@@ -83,51 +116,52 @@ impl WorldState {
             (0..=n).map(|k| start_x + (span as f32 * (k as f32 / n as f32)) as usize).collect()
         };
 
-        // ── Boat segment progress ──────────────────────────────────
-        let cur = inp.current_soldier.clamp(1, inp.soldiers.max(1)) as usize;
-        let seg_start = stops[cur - 1];
-        let seg_end = stops[cur];
-        let alw = inp.current_allowance.max(1) as f32;
-        let seg_progress = (inp.elapsed_current as f32 / alw).clamp(0.0, 1.0);
-
-        // Waterline boat (Voyage)
-        let voyage_boat_x = seg_start + ((seg_end as i32 - seg_start as i32) as f32 * seg_progress) as i32 as usize;
-        let voyage_boat_y = rows.saturating_sub(6);   // 4-tall boat sitting on horizon (rows-2)
-
-        // ── Acts: cascade only when explicitly signaled by TUI ─────
+        // ── Constant-cruise boat ───────────────────────────────────
+        // Boat goes from start_x to castle_dock_x linearly with
+        // total_elapsed/total_budget. After 1.0 it falls (Cascade/Hell).
         let progress = inp.total_elapsed as f32 / budget as f32;
-        let act = if !inp.cascade_active {
-            Act::Voyage
-        } else if progress < 2.0 {
-            Act::Cascade
-        } else {
-            Act::Abyss
+        let cruise = progress.min(1.0);
+        let voyage_boat_x = start_x + ((castle_dock_x - start_x) as f32 * cruise) as usize;
+        let voyage_boat_y = rows.saturating_sub(6);
+
+        // ── Acts & Satan staging ───────────────────────────────────
+        let (act, satan_stage) = match progress {
+            p if p < 1.0 => (Act::Voyage, SatanStage::None),
+            p if p < 2.0 => (Act::Cascade, SatanStage::None),
+            p if p < 2.5 => (Act::Cascade, SatanStage::Face),
+            p if p < 3.0 => (Act::Cascade, SatanStage::FaceTrident),
+            _            => (Act::Hell,    SatanStage::FullHell),
         };
 
         // ── Boat per act ───────────────────────────────────────────
-        let (boat_x, boat_y, boat_rotation);
+        let (boat_x, boat_y, boat_rotation, boat_wrecked);
         match act {
             Act::Voyage => {
                 boat_x = voyage_boat_x;
                 boat_y = voyage_boat_y;
                 boat_rotation = 0;
+                boat_wrecked = false;
             }
             Act::Cascade => {
-                let fall = (progress - 1.0).clamp(0.0, 1.0);
-                // First 30% of fall: continue right past castle off-screen-ish.
-                // Then start falling vertically on the right edge.
-                let horiz = fall.min(0.3) / 0.3;
-                let vert = ((fall - 0.3) / 0.7).clamp(0.0, 1.0);
-                let bx = castle_dock_x + ((cols.saturating_sub(castle_dock_x + 4)) as f32 * horiz) as usize;
+                // Boat: continues right past castle, then falls vertically
+                // along the right side. Fall progress in 0..1 across 1x..3x.
+                let fall = ((progress - 1.0) / 2.0).clamp(0.0, 1.0);
+                let horiz = (fall / 0.2).clamp(0.0, 1.0);              // first 20 % of fall
+                let vert = ((fall - 0.2) / 0.8).clamp(0.0, 1.0);
+                let bx = castle_dock_x
+                    + ((cols.saturating_sub(castle_dock_x + 9)) as f32 * horiz) as usize;
                 boat_x = bx.min(cols.saturating_sub(9));
-                let max_fall = rows.saturating_sub(3);
+                let max_fall = rows.saturating_sub(4);
                 boat_y = voyage_boat_y + ((max_fall.saturating_sub(voyage_boat_y)) as f32 * vert) as usize;
                 boat_rotation = ((inp.elapsed_ms / 250) % 4) as u8;
+                boat_wrecked = false;
             }
-            Act::Abyss => {
-                boat_x = cols.saturating_sub(12);
-                boat_y = rows.saturating_sub(5);
-                boat_rotation = ((inp.elapsed_ms / 200) % 4) as u8;
+            Act::Hell => {
+                // Boat is now a wreck on the floor.
+                boat_x = cols / 2 - 4;
+                boat_y = rows.saturating_sub(4);
+                boat_rotation = 0;
+                boat_wrecked = true;
             }
         }
 
@@ -135,11 +169,11 @@ impl WorldState {
         let horizon_y = match act {
             Act::Voyage => rows.saturating_sub(2),
             Act::Cascade => {
-                // horizon rises 1 row per second of overrun
+                // Horizon slowly rises with cascade progress.
                 let secs = (inp.total_elapsed as i32 - budget as i32).max(0) as usize;
-                rows.saturating_sub(2).saturating_sub(secs).max(rows / 4)
+                rows.saturating_sub(2).saturating_sub(secs / 2).max(rows / 5)
             }
-            Act::Abyss => rows / 4,
+            Act::Hell => rows.saturating_sub(2),
         };
 
         // ── Sun ────────────────────────────────────────────────────
@@ -147,30 +181,70 @@ impl WorldState {
             ((cols as f32 - 4.0) * progress.min(1.0)) as usize
         } else { 0 };
 
-        // ── Palm tilts ─────────────────────────────────────────────
-        // Only the destination island of the *current* speaker can tilt
-        // (because the boat is pushing it). Tilt grows with overshoot.
-        let mut palm_tilts = vec![0u8; n.saturating_sub(1)];
-        if matches!(act, Act::Voyage) {
-            let overshoot = inp.elapsed_current as i32 - inp.current_allowance;
-            if overshoot > 0 && cur >= 1 && cur <= palm_tilts.len() {
-                let denom = inp.current_allowance.max(1) as f32;
-                let ratio = (overshoot as f32 / denom).clamp(0.0, 1.0);
-                let tilt = (ratio * 3.0).round() as u8;
-                palm_tilts[cur - 1] = tilt.min(3);
+        // ── Islands state machine ──────────────────────────────────
+        // For island k (0-based, holding soldier k+2) sitting at stops[k+1]:
+        //   - consumed if soldier k+2 has already boarded (current_soldier > k+1)
+        //   - towed   if its soldier == current_soldier+1 AND boat passed it
+        //   - pulling if anchor_pull.stop_index == k+1 (animation in progress)
+        //   - else: idle at stops[k+1]
+        let mut islands = Vec::with_capacity(n.saturating_sub(1));
+        let cur = inp.current_soldier as usize;
+        for k in 0..n.saturating_sub(1) {
+            let original_x = stops[k + 1];
+            let waiting_soldier = (k + 2) as u32;          // 1-based
+            let consumed = waiting_soldier <= inp.current_soldier;
+            let mut x = original_x;
+            let mut towed = false;
+            let mut pulling = false;
+            let mut tilt = 0u8;
+            if !consumed {
+                // Anchor-pull animation overrides position.
+                if let Some(ap) = inp.anchor_pull {
+                    if ap.stop_index == k + 1 {
+                        let p = ap.progress.clamp(0.0, 1.0);
+                        let dest = boat_x.saturating_add(2);    // arrive next to boat
+                        x = lerp_x(original_x, dest, p);
+                        pulling = true;
+                        tilt = (p * 3.0).round() as u8;
+                    }
+                }
+                // If not animating, check if the boat passed: the destination
+                // of the *current* speaker is stops[cur]; the island holding
+                // the next soldier is k+1, so it's "pushable" when k+1 == cur.
+                if !pulling && k + 1 == cur && matches!(act, Act::Voyage) && boat_x > original_x {
+                    // Tow at boat_x - 2 (two characters behind the boat's left edge)
+                    let towed_x = boat_x.saturating_sub(2);
+                    x = towed_x;
+                    towed = true;
+                    // tilt grows with how far past the original we are
+                    let dist = boat_x.saturating_sub(original_x) as f32;
+                    tilt = ((dist / 8.0).clamp(0.0, 1.0) * 3.0).round() as u8;
+                }
             }
+            islands.push(IslandState { x, towed, consumed, pulling, tilt });
         }
 
-        let castle_state = if matches!(act, Act::Voyage) { CastleState::Intact } else { CastleState::Destroyed };
-        let satan_revealed = matches!(act, Act::Abyss);
+        let castle_state = if matches!(act, Act::Voyage) || (matches!(act, Act::Cascade) && progress < 1.05) {
+            CastleState::Intact
+        } else {
+            CastleState::Destroyed
+        };
         let cascade_x = cols.saturating_sub(4);
 
         WorldState {
-            cols, rows, act, sun_x, boat_x, boat_y, boat_rotation, horizon_y,
-            stops, palm_tilts, current_soldier: inp.current_soldier, soldiers: inp.soldiers,
-            castle_x, castle_w, castle_state, satan_revealed, cascade_x,
+            cols, rows, act, satan_stage, sun_x,
+            boat_x, boat_y, boat_rotation, boat_wrecked,
+            horizon_y, stops, islands,
+            current_soldier: inp.current_soldier, soldiers: inp.soldiers,
+            castle_x, castle_w, castle_state, cascade_x,
         }
     }
+}
+
+fn lerp_x(from: usize, to: usize, p: f32) -> usize {
+    let f = from as i32 as f32;
+    let t = to as i32 as f32;
+    (f + (t - f) * p).round() as i32 as usize
 }
 
 /// Paint the entire decor onto the (canvas, color_map). Call BEFORE the timer.
@@ -181,42 +255,54 @@ pub fn paint(
 ) {
     // Sky: sun
     if matches!(w.act, Act::Voyage) && w.sun_x < w.cols {
-        let y = 1;
-        place(canvas, colors, w.sun_x, y, '*', Color::Yellow);
-        if w.sun_x + 1 < w.cols { place(canvas, colors, w.sun_x + 1, y, ' ', None); }
+        place(canvas, colors, w.sun_x, 1, '*', Color::Yellow);
     }
 
-    // Horizon (sea / ground line)
-    if w.horizon_y < w.rows {
+    // Horizon (sea / ground line) — only in Voyage and Cascade
+    if !matches!(w.act, Act::Hell) && w.horizon_y < w.rows {
         for x in 0..w.cols {
             place(canvas, colors, x, w.horizon_y, '~', Color::Blue);
         }
     }
 
+    // Hell flames background (Hell only)
+    if matches!(w.act, Act::Hell) {
+        paint_hell_flames(w, canvas, colors);
+    }
+
     // Islands (Voyage only)
     if matches!(w.act, Act::Voyage) {
-        for (idx, &ix) in w.stops.iter().enumerate() {
-            // skip start dock (idx 0) and castle dock (idx N) — only paint islands in 1..N-1
-            if idx == 0 || idx + 1 == w.stops.len() { continue; }
-            let island_idx = idx - 1;          // 0..N-2
-            let soldier_idx = (idx + 1) as u32; // soldier 2 stands on islands[0], etc.
-            let already_spoke = soldier_idx < w.current_soldier;
-            let on_boat_now = soldier_idx <= w.current_soldier;
-            let tilt = w.palm_tilts.get(island_idx).copied().unwrap_or(0);
-            paint_island(canvas, colors, ix, w.horizon_y, tilt);
-            // Waiting soldier (visible only if they haven't spoken AND aren't currently aboard)
-            if !already_spoke && !on_boat_now && w.horizon_y >= 5 {
-                let y = w.horizon_y.saturating_sub(5);
-                place(canvas, colors, ix, y, 'o', Color::White);
+        for (k, isl) in w.islands.iter().enumerate() {
+            if isl.consumed { continue; }
+            paint_island(canvas, colors, isl.x, w.horizon_y, isl.tilt);
+            // Waiting soldier head
+            if w.horizon_y >= 5 {
+                place(canvas, colors, isl.x, w.horizon_y - 5, 'o', Color::White);
             }
+            // Tow rope from boat to island (when towed or pulling)
+            if (isl.towed || isl.pulling) && w.horizon_y >= 1 {
+                let rope_y = w.horizon_y - 1;
+                let (lo, hi) = if isl.x < w.boat_x {
+                    (isl.x + 1, w.boat_x)
+                } else {
+                    (w.boat_x + 9, isl.x)
+                };
+                for x in lo..hi {
+                    place(canvas, colors, x, rope_y, '-', Color::DarkGrey);
+                }
+                // Anchor at the island side
+                let anchor_x = if isl.x < w.boat_x { isl.x + 1 } else { isl.x.saturating_sub(1) };
+                place(canvas, colors, anchor_x, rope_y, 'J', Color::DarkGrey);
+            }
+            let _ = k;
         }
     }
 
     // Castle
     paint_castle(w, canvas, colors);
 
-    // Cascade waterfall (Cascade / Abyss)
-    if !matches!(w.act, Act::Voyage) {
+    // Cascade waterfall (Cascade only — Hell removes it)
+    if matches!(w.act, Act::Cascade) {
         for y in 0..w.rows {
             place(canvas, colors, w.cascade_x, y, '|', Color::Cyan);
             if w.cascade_x + 1 < w.cols {
@@ -225,29 +311,43 @@ pub fn paint(
         }
     }
 
-    // Satan throne (Abyss)
-    if w.satan_revealed && w.rows >= 6 {
-        paint_satan(w, canvas, colors);
-    }
+    // Satan staging
+    paint_satan(w, canvas, colors);
 
-    // Boat (drawn LAST so it overlays decor)
+    // Boat
     paint_boat(w, canvas, colors);
 }
 
 // ─── Boat ────────────────────────────────────────────────────────────
-//
-// Voyage frame (4 rows × 9 cols). Hull bottom sits on horizon - 1.
-//
-//      o          row 0 : soldier head
-//     /|\         row 1 : soldier with arms
-//   __|||__       row 2 : hull top + mast
-//   \_____/       row 3 : hull bottom
-//
 fn paint_boat(
     w: &WorldState,
     canvas: &mut [Vec<char>],
     colors: &mut [Vec<Option<Color>>],
 ) {
+    if w.boat_wrecked {
+        // Wreck: scattered planks, smoke, fire
+        let bx = w.boat_x;
+        let by = w.boat_y;
+        let parts = [
+            (0, 0, '\\', Color::DarkYellow),
+            (1, 0, '_', Color::DarkYellow),
+            (2, 0, '/', Color::DarkYellow),
+            (4, 0, '|', Color::DarkYellow),
+            (6, 0, '\\', Color::DarkYellow),
+            (7, 0, '_', Color::DarkYellow),
+            // smoke / fire above
+            (1, -1, '~', Color::Red),
+            (3, -1, '*', Color::Yellow),
+            (5, -1, '~', Color::Red),
+        ];
+        for (dx, dy, ch, c) in parts {
+            let x = bx as i32 + dx;
+            let y = by as i32 + dy;
+            if x >= 0 && y >= 0 { place(canvas, colors, x as usize, y as usize, ch, c); }
+        }
+        return;
+    }
+
     if matches!(w.act, Act::Voyage) {
         let bx = w.boat_x;
         let by = w.boat_y;
@@ -274,12 +374,12 @@ fn paint_boat(
         return;
     }
 
-    // Cascade / Abyss: rotating boat, 4 frames (compact 7×3 to spin nicely)
+    // Cascade: rotating boat
     let frames: [[&str; 3]; 4] = [
-        ["  o    ", "__|||__", "\\_____/"],     // upright
-        ["    o  ", "/|||___", "/_____\\"],     // tilt right
-        ["\\_____/", "__|||__", "  o    "],     // upside-down
-        ["\\_____\\", "___|||\\", "  o    "],   // tilt left
+        ["  o    ", "__|||__", "\\_____/"],
+        ["    o  ", "/|||___", "/_____\\"],
+        ["\\_____/", "__|||__", "  o    "],
+        ["\\_____\\", "___|||\\", "  o    "],
     ];
     let frame = &frames[w.boat_rotation as usize % 4];
     for (dy, line) in frame.iter().enumerate() {
@@ -293,17 +393,6 @@ fn paint_boat(
 }
 
 // ─── Island & palm ───────────────────────────────────────────────────
-//
-// Upright (tilt=0):
-//
-//     ▓▓▓        row -5 : canopy top
-//    ▓▓▓▓▓       row -4 : canopy bottom
-//      |         row -3 : trunk top
-//      |         row -2 : trunk bottom
-//   ~~~~~~~      row -1 : sand (5 wide centered)
-//
-// `cx` is the trunk centre x; horizon_y is the row WHERE the sea line is —
-// the sand replaces the sea wave on horizon_y.
 fn paint_island(
     canvas: &mut [Vec<char>],
     colors: &mut [Vec<Option<Color>>],
@@ -311,14 +400,16 @@ fn paint_island(
     horizon_y: usize,
     tilt: u8,
 ) {
-    // Sand on horizon line (5 wide)
+    if horizon_y == 0 { return; }
+    // Sand on horizon (5 wide)
     if horizon_y < canvas.len() {
         for dx in 0..5 {
             let x = cx.saturating_sub(2) + dx;
             place(canvas, colors, x, horizon_y, '~', Color::DarkYellow);
         }
     }
-    // Trunk (2 rows). Tilt: 0 upright, 1 lean by 1, 2 lean by 1.5, 3 by 2.
+    let brown = Color::Rgb { r: 139, g: 69, b: 19 };
+    // Trunk
     let (trunk_offsets, trunk_chars): ([i32; 2], [char; 2]) = match tilt {
         0 => ([0, 0], ['|', '|']),
         1 => ([1, 0], ['/', '|']),
@@ -326,28 +417,28 @@ fn paint_island(
         _ => ([2, 1], ['_', '/']),
     };
     if horizon_y >= 1 {
-        let y = horizon_y - 1;          // trunk bottom
-        let x = (cx as i32 + trunk_offsets[1]) as usize;
-        place(canvas, colors, x, y, trunk_chars[1], Color::Rgb { r: 139, g: 69, b: 19 });
+        let y = horizon_y - 1;
+        let x = (cx as i32 + trunk_offsets[1]).max(0) as usize;
+        place(canvas, colors, x, y, trunk_chars[1], brown);
     }
     if horizon_y >= 2 {
-        let y = horizon_y - 2;          // trunk top
-        let x = (cx as i32 + trunk_offsets[0]) as usize;
-        place(canvas, colors, x, y, trunk_chars[0], Color::Rgb { r: 139, g: 69, b: 19 });
+        let y = horizon_y - 2;
+        let x = (cx as i32 + trunk_offsets[0]).max(0) as usize;
+        place(canvas, colors, x, y, trunk_chars[0], brown);
     }
-    // Canopy: 5-wide bottom, 3-wide top, shifted by tilt
+    // Canopy (5-wide bottom, 3-wide top)
     let canopy_dx: i32 = match tilt { 0 => 0, 1 => 1, 2 => 2, _ => 3 };
     if horizon_y >= 3 {
         let y = horizon_y - 3;
         for dx in 0..5 {
-            let x = (cx as i32 - 2 + dx + canopy_dx) as usize;
+            let x = (cx as i32 - 2 + dx + canopy_dx).max(0) as usize;
             place(canvas, colors, x, y, '#', Color::Green);
         }
     }
     if horizon_y >= 4 {
         let y = horizon_y - 4;
         for dx in 0..3 {
-            let x = (cx as i32 - 1 + dx + canopy_dx) as usize;
+            let x = (cx as i32 - 1 + dx + canopy_dx).max(0) as usize;
             place(canvas, colors, x, y, '#', Color::DarkGreen);
         }
     }
@@ -359,6 +450,8 @@ fn paint_castle(
     canvas: &mut [Vec<char>],
     colors: &mut [Vec<Option<Color>>],
 ) {
+    // Hell removes the castle entirely — boat is on the hell floor.
+    if matches!(w.act, Act::Hell) { return; }
     if matches!(w.castle_state, CastleState::Intact) && w.horizon_y >= 4 {
         let cw = w.castle_w;
         let cx = w.castle_x;
@@ -386,12 +479,13 @@ fn paint_castle(
     }
 }
 
-// ─── Satan throne ────────────────────────────────────────────────────
+// ─── Satan staging ───────────────────────────────────────────────────
 fn paint_satan(
     w: &WorldState,
     canvas: &mut [Vec<char>],
     colors: &mut [Vec<Option<Color>>],
 ) {
+    if matches!(w.satan_stage, SatanStage::None) { return; }
     let sx = w.cols / 3;
     let sy = w.rows.saturating_sub(5);
     if sy + 4 >= w.rows { return; }
@@ -400,21 +494,50 @@ fn paint_satan(
         let ch = if dx % 2 == 0 { '\\' } else { '/' };
         place(canvas, colors, sx + dx, sy, ch, Color::Red);
     }
-    // Face row
+    // Face row (always once Satan is visible)
     place(canvas, colors, sx + 2, sy + 1, '(', Color::Red);
     place(canvas, colors, sx + 3, sy + 1, 'o', Color::Yellow);
     place(canvas, colors, sx + 4, sy + 1, '_', Color::Red);
     place(canvas, colors, sx + 5, sy + 1, 'o', Color::Yellow);
     place(canvas, colors, sx + 6, sy + 1, ')', Color::Red);
-    // Trident row
-    place(canvas, colors, sx + 1, sy + 2, '~', Color::DarkRed);
-    place(canvas, colors, sx + 3, sy + 2, '|', Color::DarkRed);
-    place(canvas, colors, sx + 4, sy + 2, 'Y', Color::Yellow);
-    place(canvas, colors, sx + 5, sy + 2, '|', Color::DarkRed);
-    place(canvas, colors, sx + 7, sy + 2, '~', Color::DarkRed);
+    // Trident row (FaceTrident or FullHell)
+    if !matches!(w.satan_stage, SatanStage::Face) {
+        place(canvas, colors, sx + 1, sy + 2, '\\', Color::DarkRed);
+        place(canvas, colors, sx + 2, sy + 2, 'V', Color::Yellow);
+        place(canvas, colors, sx + 3, sy + 2, 'V', Color::Yellow);
+        place(canvas, colors, sx + 4, sy + 2, 'V', Color::Yellow);
+        place(canvas, colors, sx + 5, sy + 2, '|', Color::DarkRed);
+        place(canvas, colors, sx + 6, sy + 2, '|', Color::DarkRed);
+        place(canvas, colors, sx + 7, sy + 2, '/', Color::DarkRed);
+    }
     // Throne base
     for dx in 0..9 {
         place(canvas, colors, sx + dx, sy + 3, '#', Color::DarkRed);
+    }
+}
+
+// ─── Hell flames background ──────────────────────────────────────────
+fn paint_hell_flames(
+    w: &WorldState,
+    canvas: &mut [Vec<char>],
+    colors: &mut [Vec<Option<Color>>],
+) {
+    // Fill the screen with flickering red/orange flame characters using a
+    // cheap deterministic pseudo-random based on (x, y, time bucket).
+    let palette = [Color::Red, Color::DarkRed, Color::Yellow, Color::Red, Color::DarkRed];
+    let chars = ['^', '\\', '/', '|', 'A', 'V', '*', '~'];
+    for y in 1..w.rows.saturating_sub(1) {
+        for x in 0..w.cols {
+            let h = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503) ^ ((y % 3) * 17)) as usize;
+            let ch = chars[h % chars.len()];
+            let col = palette[(h >> 3) % palette.len()];
+            place(canvas, colors, x, y, ch, col);
+        }
+    }
+    // Ground line (bottom) of bright orange
+    let gy = w.rows.saturating_sub(2);
+    for x in 0..w.cols {
+        place(canvas, colors, x, gy, '#', Color::Yellow);
     }
 }
 
@@ -437,35 +560,57 @@ pub fn place(
 mod tests {
     use super::*;
 
-    fn make(total_elapsed: u32, total_budget: u32, soldiers: u32, current: u32,
-            elapsed: u32, allowance: i32, cascade: bool) -> WorldState {
+    fn make(progress: f32, soldiers: u32, current: u32, elapsed: u32, ap: Option<AnchorPull>) -> WorldState {
+        let budget = 60u32;
+        let total_elapsed = (budget as f32 * progress) as u32;
         WorldState::compute(&Inputs {
-            total_elapsed, total_budget, soldiers, current_soldier: current,
-            elapsed_current: elapsed, current_allowance: allowance,
-            cols: 80, rows: 24, elapsed_ms: 0, cascade_active: cascade,
+            total_elapsed, total_budget: budget, soldiers,
+            current_soldier: current, elapsed_current: elapsed,
+            current_allowance: 20, cols: 80, rows: 24, elapsed_ms: 0,
+            anchor_pull: ap,
         })
     }
 
     #[test]
-    fn voyage_unless_cascade_active() {
-        // total far exceeds budget but cascade not signaled -> still voyage
-        assert_eq!(make(120, 60, 3, 1, 10, 20, false).act, Act::Voyage);
-        assert_eq!(make(70, 60, 3, 3, 10, 20, true).act, Act::Cascade);
-        assert_eq!(make(140, 60, 3, 3, 10, 20, true).act, Act::Abyss);
+    fn satan_stages_at_2x_2_5x_3x() {
+        assert_eq!(make(0.5, 3, 1, 5, None).satan_stage, SatanStage::None);
+        assert_eq!(make(1.5, 3, 3, 90, None).satan_stage, SatanStage::None);
+        assert_eq!(make(2.1, 3, 3, 120, None).satan_stage, SatanStage::Face);
+        assert_eq!(make(2.6, 3, 3, 150, None).satan_stage, SatanStage::FaceTrident);
+        assert_eq!(make(3.1, 3, 3, 180, None).satan_stage, SatanStage::FullHell);
     }
 
     #[test]
-    fn n_plus_1_stops_for_n_soldiers() {
-        let w = make(0, 60, 5, 1, 0, 12, false);
-        assert_eq!(w.stops.len(), 6);          // start + 4 islands + castle dock
-        assert_eq!(w.palm_tilts.len(), 4);     // N-1 palms
+    fn hell_act_at_3x() {
+        assert_eq!(make(2.9, 3, 3, 170, None).act, Act::Cascade);
+        let w = make(3.1, 3, 3, 180, None);
+        assert_eq!(w.act, Act::Hell);
+        assert!(w.boat_wrecked);
     }
 
     #[test]
-    fn palm_tilts_only_when_overshooting() {
-        let no_overshoot = make(5, 60, 3, 1, 5, 20, false);
-        assert_eq!(no_overshoot.palm_tilts[0], 0);
-        let overshooting = make(40, 60, 3, 1, 40, 20, false);
-        assert!(overshooting.palm_tilts[0] >= 1);
+    fn boat_constant_cruise_independent_of_speaker() {
+        // Same total_elapsed → same boat_x regardless of which speaker.
+        let a = make(0.5, 4, 1, 30, None);
+        let b = make(0.5, 4, 3, 30, None);
+        assert_eq!(a.boat_x, b.boat_x);
+    }
+
+    #[test]
+    fn island_towed_when_boat_passes_without_pickup() {
+        // 4 soldiers, boat at progress=0.4 (40% of cruise). Stops are at
+        // 0%, 25%, 50%, 75%, 100%. Boat is past stops[1] (25%) so island 0
+        // (the destination of speaker 1) should be towed.
+        let w = make(0.4, 4, 1, 24, None);
+        assert!(w.islands[0].towed, "island 0 should be towed at progress 0.4 with current=1");
+        // Island 1 (destination of speaker 2) is NOT towed yet (boat hasn't arrived).
+        assert!(!w.islands[1].towed);
+    }
+
+    #[test]
+    fn anchor_pull_overrides_island_position() {
+        let w = make(0.2, 4, 1, 12, Some(AnchorPull { stop_index: 1, progress: 0.5 }));
+        assert!(w.islands[0].pulling);
+        assert!(!w.islands[0].towed);
     }
 }

@@ -311,31 +311,91 @@ fn field_line<W: Write>(out: &mut W, label: &str, value: &str, selected: bool, w
 
 // ─── Running screen: big centered timer + landscape ────────────────────
 
-/// In-progress overlay animation. Frames render on top of the static landscape.
 #[derive(Debug, Clone)]
 enum Anim {
-    /// Anchor flying from boat to next stop, then dragging it to the boat.
-    /// Plays 5 frames at ~25 fps. On completion, calls `next_soldier()`.
-    AnchorPull { frame: u8, started: Instant, target_kind: AnchorTarget },
-    /// Mario-style victory: castle pulled in, flag rises, 4 fireworks. On
-    /// completion, calls `session.close()`.
+    /// Pressing `n` early: the next island is being dragged TOWARD the boat
+    /// over `ANCHOR_FRAMES` frames at ~25 fps. On completion, advances.
+    AnchorPull { frame: u8, started: Instant, stop_index: usize, last: bool },
+    /// Last speaker hands over while still in budget: castle is dragged in,
+    /// flag rises, fireworks burst. On completion, calls `session.close()`.
     MarioVictory { frame: u8, started: Instant },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum AnchorTarget { Island, Castle }
-
-const ANIM_FRAME_MS: u64 = 40;          // 25 fps
+const ANIM_FRAME_MS: u64 = 40;          // 25 fps render cadence
 const ANCHOR_FRAMES: u8 = 5;
 const VICTORY_FRAMES: u8 = 24;          // ~1 s
+
+/// Diff renderer: tracks the previous canvas + colors and only emits
+/// characters that actually changed since the last frame. Removes the
+/// per-frame full-screen Clear that used to make the timer flicker.
+struct DiffRenderer {
+    prev_canvas: Vec<Vec<char>>,
+    prev_colors: Vec<Vec<Option<Color>>>,
+    cols: usize,
+    rows: usize,
+    fresh: bool,
+}
+
+impl DiffRenderer {
+    fn new() -> Self {
+        Self { prev_canvas: vec![], prev_colors: vec![], cols: 0, rows: 0, fresh: true }
+    }
+    fn render<W: Write>(
+        &mut self,
+        out: &mut W,
+        canvas: &[Vec<char>],
+        colors: &[Vec<Option<Color>>],
+    ) -> Result<()> {
+        let new_rows = canvas.len();
+        let new_cols = if new_rows > 0 { canvas[0].len() } else { 0 };
+        let resized = self.fresh || new_cols != self.cols || new_rows != self.rows;
+        if resized {
+            queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+            self.cols = new_cols;
+            self.rows = new_rows;
+            self.prev_canvas = vec![vec![' '; new_cols]; new_rows];
+            self.prev_colors = vec![vec![None; new_cols]; new_rows];
+            self.fresh = false;
+        }
+        for y in 0..new_rows {
+            let mut x = 0;
+            while x < new_cols {
+                let same = canvas[y][x] == self.prev_canvas[y][x]
+                    && colors[y][x] == self.prev_colors[y][x];
+                if same {
+                    x += 1;
+                    continue;
+                }
+                let start_x = x;
+                let run_color = colors[y][x];
+                let mut buf = String::new();
+                while x < new_cols
+                    && colors[y][x] == run_color
+                    && (canvas[y][x] != self.prev_canvas[y][x]
+                        || colors[y][x] != self.prev_colors[y][x])
+                {
+                    buf.push(canvas[y][x]);
+                    x += 1;
+                }
+                queue!(out, cursor::MoveTo(start_x as u16, y as u16))?;
+                write_colored(out, &buf, run_color)?;
+            }
+            self.prev_canvas[y].clone_from(&canvas[y]);
+            self.prev_colors[y].clone_from(&colors[y]);
+        }
+        out.flush()?;
+        Ok(())
+    }
+}
 
 fn running_loop<W: Write>(out: &mut W, session: &mut Session, _auto_advance: bool) -> Result<()> {
     let mut last_sec_tick = Instant::now();
     let start = Instant::now();
     let mut frame: u64 = 0;
     let mut anim: Option<Anim> = None;
-    // Latched once the last speaker pushes total beyond budget (no recovery).
+    // Latched once total > budget — boat falls, mission report waits for user.
     let mut cascade_active = false;
+    let mut renderer = DiffRenderer::new();
 
     loop {
         // ── Input ─────────────────────────────────────────────────────
@@ -344,17 +404,17 @@ fn running_loop<W: Write>(out: &mut W, session: &mut Session, _auto_advance: boo
                 if k.kind == KeyEventKind::Press {
                     let in_anim = anim.is_some();
                     match k.code {
-                        // Pause works any time
+                        // Pause works in voyage mode (not during anim or cascade)
                         KeyCode::Char(' ') if !cascade_active && !in_anim => session.toggle_pause(),
 
-                        // Cascade-fail: q/Esc/Enter/Space close the session.
+                        // Cascade-fail: q/Esc/Enter/Space close the mission.
                         KeyCode::Char(' ') | KeyCode::Enter
                         | KeyCode::Char('q') | KeyCode::Esc if cascade_active => {
                             session.close();
                             break;
                         }
 
-                        // Manual abort
+                        // Manual abort (voyage)
                         KeyCode::Char('q') | KeyCode::Esc if !in_anim => { session.abort(); break; }
 
                         // Manual next
@@ -363,19 +423,21 @@ fn running_loop<W: Write>(out: &mut W, session: &mut Session, _auto_advance: boo
                             let last = snap.current_soldier == snap.soldiers;
                             let elapsed = snap.elapsed_current as i32;
                             let alw = snap.current_allowance.max(1);
-                            let early = elapsed < alw;       // boat hasn't reached destination
+                            let early = elapsed < alw;
                             let within_budget = snap.total_elapsed <= snap.total_budget;
 
                             if last && early && within_budget {
                                 anim = Some(Anim::MarioVictory { frame: 0, started: Instant::now() });
                             } else if early {
-                                let kind = if last { AnchorTarget::Castle } else { AnchorTarget::Island };
                                 anim = Some(Anim::AnchorPull {
-                                    frame: 0, started: Instant::now(),
-                                    target_kind: kind,
+                                    frame: 0,
+                                    started: Instant::now(),
+                                    stop_index: snap.current_soldier as usize,
+                                    last,
                                 });
                             } else {
-                                // Already at (or past) the destination — just advance.
+                                // Boat already at (or past) destination — towed
+                                // island just gets boarded immediately.
                                 session.next_soldier();
                             }
                         }
@@ -395,14 +457,13 @@ fn running_loop<W: Write>(out: &mut W, session: &mut Session, _auto_advance: boo
             if s.total_elapsed > s.total_budget {
                 telemetry::count_cascade_second();
             }
-            // Latch cascade if the LAST speaker has overrun the global budget.
-            if !cascade_active
-                && s.current_soldier == s.soldiers
-                && s.total_elapsed > s.total_budget
-            {
+            // Latch cascade as soon as total > budget — boat reached the
+            // castle dock without finishing → mission failure.
+            if !cascade_active && s.total_elapsed > s.total_budget {
                 cascade_active = true;
-                info!(event = "cascade_started", total = s.total_elapsed,
-                    budget = s.total_budget, "team failed to dock — falling into cascade");
+                info!(event = "cascade_started",
+                    total = s.total_elapsed, budget = s.total_budget,
+                    "team failed to dock — falling into cascade");
             }
         }
 
@@ -438,12 +499,9 @@ fn running_loop<W: Write>(out: &mut W, session: &mut Session, _auto_advance: boo
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let blink_500 = ((elapsed_ms / 500) % 2) as u8;
         let blink_1000 = ((elapsed_ms / 1000) % 2) as u8;
-        draw_running(out, session, frame, blink_500, blink_1000, elapsed_ms,
+        draw_running(out, &mut renderer, session, frame, blink_500, blink_1000, elapsed_ms,
                      cascade_active, anim.as_ref())?;
 
-        // Exit when session left the running family (Closing/Aborted) — but
-        // ONLY if we are not in cascade-fail mode, where Closing is reached
-        // only via explicit user keypress (handled above).
         if matches!(session.phase(), Phase::Closing | Phase::Aborted) && !cascade_active { break; }
 
         std::thread::sleep(Duration::from_millis(ANIM_FRAME_MS));
@@ -453,6 +511,7 @@ fn running_loop<W: Write>(out: &mut W, session: &mut Session, _auto_advance: boo
 
 fn draw_running<W: Write>(
     out: &mut W,
+    renderer: &mut DiffRenderer,
     session: &Session,
     frame: u64,
     blink_500: u8,
@@ -486,6 +545,15 @@ fn draw_running<W: Write>(
     let mut canvas: Vec<Vec<char>> = vec![vec![' '; cols]; rows];
     let mut color_map: Vec<Vec<Option<Color>>> = vec![vec![None; cols]; rows];
 
+    // Pass anchor-pull progress into landscape so the island moves smoothly.
+    let anchor_pull = match anim {
+        Some(Anim::AnchorPull { frame, stop_index, last, .. }) if !*last => {
+            let p = (*frame as f32) / (ANCHOR_FRAMES - 1).max(1) as f32;
+            Some(landscape::AnchorPull { stop_index: *stop_index, progress: p.min(1.0) })
+        }
+        _ => None,
+    };
+
     let world = landscape::WorldState::compute(&landscape::Inputs {
         total_elapsed: snap.total_elapsed,
         total_budget: snap.total_budget,
@@ -494,20 +562,13 @@ fn draw_running<W: Write>(
         elapsed_current: snap.elapsed_current,
         current_allowance: snap.current_allowance,
         cols, rows, elapsed_ms,
-        cascade_active,
+        anchor_pull,
     });
     landscape::paint(&world, &mut canvas, &mut color_map);
 
-    // ── Animations overlay (between landscape and timer) ──────────────
-    if let Some(a) = anim {
-        match a {
-            Anim::AnchorPull { frame, target_kind, .. } => {
-                paint_anchor(&mut canvas, &mut color_map, &world, *frame, *target_kind);
-            }
-            Anim::MarioVictory { frame, .. } => {
-                paint_victory(&mut canvas, &mut color_map, &world, *frame);
-            }
-        }
+    // Mario victory overlay (castle pulled, flag, fireworks).
+    if let Some(Anim::MarioVictory { frame, .. }) = anim {
+        paint_victory(&mut canvas, &mut color_map, &world, *frame);
     }
 
     // ── Big timer ─────────────────────────────────────────────────────
@@ -551,7 +612,7 @@ fn draw_running<W: Write>(
     let bonus_str = if bonus > 0 { format!(" (+{}s pool)", bonus) }
         else if bonus < 0 { format!(" ({}s pool)", bonus) } else { String::new() };
     let header = format!(
-        " D A I L Y   C O M M A N D O   —   {} ({}/{}){}   prep:{}",
+        " D A I L Y   C O M M A N D O   --   {} ({}/{}){}   prep:{}",
         snap.current_name, snap.current_soldier, snap.soldiers, bonus_str, fmt(snap.prep_seconds)
     );
     paint_string(&mut canvas, &mut color_map, 1, 0, &header, Color::DarkYellow);
@@ -561,10 +622,10 @@ fn draw_running<W: Write>(
         Phase::Closing => "CLOSING", Phase::Aborted => "ABORTED", Phase::Finished => "FINISHED",
     };
     let footer = if cascade_active {
-        format!(" 🔥 CASCADE  total {} / {}   [Q/Enter/Space] end mission",
+        format!(" *** CASCADE ***  total {} / {}   [Q/Enter/Space] end mission",
             fmt(snap.total_elapsed), fmt(snap.total_budget))
     } else {
-        format!(" phase:{}  total {} / {}   [SPACE] pause  [N/→] next  [Q/ESC] abort",
+        format!(" phase:{}  total {} / {}   [SPACE] pause  [N] next  [Q/ESC] abort",
             phase_str, fmt(snap.total_elapsed), fmt(snap.total_budget))
     };
     if rows >= 1 {
@@ -573,63 +634,12 @@ fn draw_running<W: Write>(
     }
     let _ = frame;
 
-    // ── Flush canvas ─────────────────────────────────────────────────
-    queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-    for y in 0..rows {
-        let mut current_color: Option<Color> = None;
-        let mut buf = String::new();
-        for x in 0..cols {
-            let ch = canvas[y][x];
-            let c = color_map[y][x];
-            if c != current_color {
-                if !buf.is_empty() {
-                    write_colored(out, &buf, current_color)?;
-                    buf.clear();
-                }
-                current_color = c;
-            }
-            buf.push(ch);
-        }
-        if !buf.is_empty() {
-            write_colored(out, &buf, current_color)?;
-        }
-        if y + 1 < rows { queue!(out, Print("\r\n"))?; }
-    }
-    out.flush()?;
+    // ── Diff flush ───────────────────────────────────────────────────
+    renderer.render(out, &canvas, &color_map)?;
     Ok(())
 }
 
-// ─── Animation overlays ─────────────────────────────────────────────────
-
-fn paint_anchor(
-    canvas: &mut [Vec<char>],
-    colors: &mut [Vec<Option<Color>>],
-    w: &landscape::WorldState,
-    frame: u8,
-    target_kind: AnchorTarget,
-) {
-    // Boat anchor origin (right side of hull)
-    let bx_origin = w.boat_x + 8;
-    let by = w.boat_y + 2;
-    // Target x: next stop (= w.stops[current_soldier])
-    let cur = w.current_soldier as usize;
-    let target_x = if target_kind == AnchorTarget::Castle {
-        w.castle_x.saturating_sub(2)
-    } else {
-        *w.stops.get(cur).unwrap_or(&bx_origin)
-    };
-
-    // Frames 0..ANCHOR_FRAMES-1: anchor flies; we also visually drag the
-    // island's *trunk* progressively closer to the boat.
-    let f = frame.min(ANCHOR_FRAMES - 1) as f32 / (ANCHOR_FRAMES - 1) as f32;
-    let anchor_x = bx_origin + ((target_x as i32 - bx_origin as i32) as f32 * (1.0 - f)) as i32 as usize;
-    landscape::place(canvas, colors, anchor_x, by, '⌬', Color::DarkGrey);
-    // Rope
-    let (lo, hi) = if anchor_x < bx_origin { (anchor_x, bx_origin) } else { (bx_origin, anchor_x) };
-    for x in lo..=hi {
-        if x != anchor_x { landscape::place(canvas, colors, x, by, '-', Color::DarkGrey); }
-    }
-}
+// ─── Mario victory overlay ─────────────────────────────────────────────
 
 fn paint_victory(
     canvas: &mut [Vec<char>],
@@ -637,13 +647,12 @@ fn paint_victory(
     w: &landscape::WorldState,
     frame: u8,
 ) {
-    // Flag rising on top of the castle. Frame 0..VICTORY_FRAMES, height grows.
     let cw = w.castle_w;
     let cx = w.castle_x;
     let top_y = w.horizon_y.saturating_sub(4);
     if w.horizon_y < 5 { return; }
     let pole_x = cx + cw / 2;
-    let max_h = (top_y).min(8);
+    let max_h = top_y.min(8);
     let h = ((frame as usize) * max_h / VICTORY_FRAMES as usize).min(max_h);
     for dy in 0..=h {
         let y = top_y.saturating_sub(dy);
@@ -654,7 +663,6 @@ fn paint_victory(
     landscape::place(canvas, colors, pole_x + 2, flag_y, '#', Color::Red);
     landscape::place(canvas, colors, pole_x + 3, flag_y, '>', Color::Red);
 
-    // 4 fireworks at frames 6,10,14,18 — each lasts 4 frames.
     let bursts = [(6u8, cx.saturating_sub(8), top_y.saturating_sub(4)),
                   (10, cx + cw + 4, top_y.saturating_sub(6)),
                   (14, cx.saturating_sub(4), top_y.saturating_sub(8).max(2)),
@@ -675,6 +683,7 @@ fn paint_victory(
         }
     }
 }
+
 
 fn write_colored<W: Write>(out: &mut W, s: &str, c: Option<Color>) -> Result<()> {
     if let Some(c) = c {
