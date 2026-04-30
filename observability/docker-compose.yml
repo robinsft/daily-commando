@@ -1,0 +1,63 @@
+# Daily Commando — Observability stack
+#
+# Brings up:
+#   * victoria-metrics : TSDB + PromQL endpoint (port 8428)
+#   * vmagent          : scraper that pulls /metrics from the host CLI
+#   * grafana          : dashboards UI (port 3000, admin/admin)
+#
+# Run the daily-commando binary on the host with default --metrics-port 9464,
+# vmagent will scrape it via host.docker.internal:9464.
+#
+# Usage:
+#   docker compose -f observability/docker-compose.yml up -d
+#   ./target/release/daily-commando --metrics-port 9464
+#   open http://localhost:3000  (login admin / admin)
+
+services:
+  victoria-metrics:
+    image: victoriametrics/victoria-metrics:v1.106.1
+    container_name: dc-vm
+    ports:
+      - "8428:8428"
+    command:
+      - "--storageDataPath=/storage"
+      - "--retentionPeriod=7d"
+    volumes:
+      - vm_data:/storage
+    restart: unless-stopped
+
+  vmagent:
+    image: victoriametrics/vmagent:v1.106.1
+    container_name: dc-vmagent
+    depends_on:
+      - victoria-metrics
+    command:
+      - "--promscrape.config=/etc/vmagent/scrape.yml"
+      - "--remoteWrite.url=http://victoria-metrics:8428/api/v1/write"
+    volumes:
+      - ./vmagent/scrape.yml:/etc/vmagent/scrape.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:11.3.0
+    container_name: dc-grafana
+    depends_on:
+      - victoria-metrics
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  vm_data:
+  grafana_data:

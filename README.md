@@ -14,11 +14,48 @@ cargo run --release -- -n 5 -t 15 -m json    # one JSON tick per second on stdou
 ```
 
 Flags:
-- `-n, --soldiers N`  participants (1..=20, default 5)
-- `-t, --minutes M`   total daily duration in minutes (default 15)
+- `-n, --soldiers N`     participants (1..=20, default 5)
+- `-t, --minutes M`      total daily duration in minutes (default 15)
 - `-m, --mode tui|json`  output mode (default `tui`)
+- `--names a,b,c`        pre-fill soldier names (skips name prompts)
+- `--skip-welcome`       jump straight into the run (TUI)
+- `--metrics-port PORT`  Prometheus `/metrics` endpoint (default `9464`)
+- `--no-metrics`         disable the metrics HTTP server
 
-TUI controls: `SPACE` pause/resume · `n` or `→` next soldier · `q`/`ESC` abort.
+## TUI controls
+
+### Welcome / preparation screen
+| Key             | Action                                                |
+|-----------------|-------------------------------------------------------|
+| `Tab` / `↑` `↓` | Move focus between fields                             |
+| `Enter`         | Validate field / start the daily when on the button   |
+| `s` or `F5`     | **Shuffle** the running order randomly                |
+| `r` or `F6`     | **Reset** to the order initially typed                |
+| `Alt+↑` / `Alt+↓` | **Move** the focused soldier up / down              |
+| `q` / `Esc`     | Abort                                                 |
+
+The 1-based index in front of each soldier **is** the speaking order.
+
+### Running screen
+| Key                | Action                            |
+|--------------------|-----------------------------------|
+| `Space`            | Pause / resume                    |
+| `n` or `→`         | Skip to next soldier              |
+| `q` / `Esc`        | Abort the daily                   |
+
+The display is a side-scroller:
+
+* a **big centered ASCII timer** counts down the current soldier's slot,
+* a **boat** carries the team from left to right across an ocean dotted with
+  one **island** per relay (n − 1 palmiers),
+* the **castle** on the right is the goal — reach it before the time is up,
+* at **66 %** of the per-soldier budget the timer font switches to the corrupt
+  `ko` glyphs (visual warning),
+* during the **last 5 s** the two fonts alternate every tick,
+* in **overtime** the boat falls into an **infinite cascade** (rotating, the
+  horizon rises) — the castle is destroyed,
+* at **2× the total budget** the boat crashes into **Satan's throne** at the
+  bottom of the abyss (easter egg 🔥).
 
 ## Architecture
 
@@ -27,11 +64,42 @@ src/
 ├── lib.rs          re-exports the domain
 ├── session.rs      pure state machine, no I/O — future web backend reuses this as-is
 ├── main.rs         CLI parsing
-├── render_tui.rs   crossterm ASCII-art renderer
+├── telemetry.rs    OpenTelemetry-style logs/metrics + Prometheus /metrics HTTP
+├── ascii_fonts.rs  big 7×7 digit glyphs (Ok / Ko)
+├── landscape.rs    sun, boat, islands, castle, cascade, Satan
+├── render_tui.rs   crossterm ASCII-art renderer (welcome + run + closing)
 └── render_json.rs  newline-delimited JSON renderer (pipe-friendly)
 ```
 
-No names, no personal data: soldiers are identified by 1-based index only.
+The CLI is the future **backend**; both renderers consume the same `Tick`
+snapshots so a web UI can be plugged on top of `Session` later without
+touching the timer logic.
+
+## Observability
+
+The binary is instrumented with `tracing` (structured logs) and `prometheus`
+metrics. A ready-to-use stack is provided under `observability/`:
+
+```sh
+docker compose -f observability/docker-compose.yml up -d
+cargo run --release -- -n 3 -t 5            # leave it running
+open http://localhost:3000                  # Grafana, anonymous viewer enabled
+```
+
+Stack:
+* **VictoriaMetrics** (`:8428`) — TSDB + PromQL
+* **vmagent** — scrapes `host.docker.internal:9464/metrics` every 5 s
+* **Grafana** (`:3000`, `admin` / `admin`) — pre-provisioned dashboard
+  *Daily Commando — Mission Control* (phase rates, current soldier, overtime,
+  cascade seconds, Satan-reached).
+
+Exposed metrics (prefix `daily_commando_`):
+`sessions_total`, `phase_seconds_total{phase=…}`, `current_soldier_index`,
+`soldier_seconds{index,name}`, `overtime_seconds`, `soldiers_boarded`,
+`cascade_seconds_total`, `satan_reached`.
+
+No personal data leaves the host: soldier names are kept locally; only their
+1-based index travels in metric labels by default.
 
 ## License
 

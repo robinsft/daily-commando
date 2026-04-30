@@ -8,18 +8,15 @@
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, queue,
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use daily_commando::{telemetry, Phase, Session, SessionConfig};
+use daily_commando::{ascii_fonts, landscape, telemetry, Phase, Session, SessionConfig};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 use tracing::{info, info_span};
-
-const FRAME_A: [&str; 5] = [r"   ___ ", r"  [o_o]", r" /|___|\", r"  |   | ", r" / \ / \"];
-const FRAME_B: [&str; 5] = [r"   ___ ", r"  [o_o]", r" \|___|/", r"  |   | ", r"  | X | "];
 
 pub fn run(session: Session, auto_advance: bool, skip_welcome: bool) -> Result<()> {
     let mut stdout = io::stdout();
@@ -43,7 +40,6 @@ fn run_all<W: Write>(
     auto_advance: bool,
     skip_welcome: bool,
 ) -> Result<Session> {
-    // ── Preparation ──────────────────────────────────────────────────
     if !skip_welcome {
         let span = info_span!("session.preparation").entered();
         info!(phase = "preparation", "welcome screen opened");
@@ -61,7 +57,6 @@ fn run_all<W: Write>(
         "daily commenced"
     );
 
-    // ── Running ──────────────────────────────────────────────────────
     {
         let span = info_span!("session.running").entered();
         running_loop(out, &mut session, auto_advance)?;
@@ -72,7 +67,6 @@ fn run_all<W: Write>(
         return Ok(session);
     }
 
-    // ── Closing ──────────────────────────────────────────────────────
     {
         let span = info_span!("session.closing").entered();
         info!(
@@ -97,25 +91,30 @@ fn welcome_loop<W: Write>(out: &mut W, session: &mut Session) -> Result<()> {
     let mut names: Vec<String> = (0..cfg0.soldiers as usize)
         .map(|i| cfg0.names.get(i).cloned().unwrap_or_else(|| format!("Soldier {}", i + 1)))
         .collect();
+    let mut original_names = names.clone();
     let mut field = Field::Soldiers;
     let mut last_tick = Instant::now();
 
     loop {
-        // 1-second clock for preparation counter
         if last_tick.elapsed() >= Duration::from_secs(1) {
             session.tick_one_second();
             telemetry::count_phase_second(session.phase());
             last_tick = Instant::now();
         }
 
-        // sync working buffers into session config so prep snapshot stays fresh
         let n = soldiers_buf.parse::<u32>().unwrap_or(0).clamp(1, 20);
-        if names.len() < n as usize {
-            for i in names.len()..n as usize {
-                names.push(format!("Soldier {}", i + 1));
-            }
+        // keep names + original_names sized to N
+        while names.len() < n as usize {
+            let i = names.len();
+            names.push(format!("Soldier {}", i + 1));
+        }
+        while original_names.len() < n as usize {
+            let i = original_names.len();
+            original_names.push(format!("Soldier {}", i + 1));
         }
         names.truncate(n as usize);
+        original_names.truncate(n as usize);
+
         let mins = minutes_buf.parse::<u32>().unwrap_or(0).max(1);
         session.update_config(SessionConfig {
             soldiers: n,
@@ -130,18 +129,63 @@ fn welcome_loop<W: Write>(out: &mut W, session: &mut Session) -> Result<()> {
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind != KeyEventKind::Press { continue; }
+                let editing_name = matches!(field, Field::Name(_));
+                let alt_held = k.modifiers.contains(KeyModifiers::ALT);
+
+                // Alt+Up/Down: manual reorder of the focused soldier
+                if alt_held && matches!(k.code, KeyCode::Up | KeyCode::Down) {
+                    if let Field::Name(i) = field {
+                        let new_i = match k.code {
+                            KeyCode::Up if i > 0 => Some(i - 1),
+                            KeyCode::Down if i + 1 < names.len() => Some(i + 1),
+                            _ => None,
+                        };
+                        if let Some(j) = new_i {
+                            names.swap(i, j);
+                            field = Field::Name(j);
+                            info!(event = "roster_reorder", action = "move",
+                                from = i, to = j, "soldier moved");
+                        }
+                    }
+                    continue;
+                }
+
                 match k.code {
-                    KeyCode::Esc | KeyCode::Char('q') => { session.abort(); return Ok(()); }
+                    KeyCode::Esc | KeyCode::Char('q') if !editing_name => {
+                        session.abort(); return Ok(());
+                    }
+                    KeyCode::Esc => { session.abort(); return Ok(()); }
+                    // F2: commence; F5: shuffle (always); F6: reset (always)
+                    KeyCode::F(2) => return Ok(()),
+                    KeyCode::F(5) => {
+                        shuffle_in_place(&mut names);
+                        info!(event = "roster_reorder", action = "shuffle",
+                            via = "F5", "roster shuffled");
+                    }
+                    KeyCode::F(6) => {
+                        names.clone_from(&original_names);
+                        info!(event = "roster_reorder", action = "reset",
+                            via = "F6", "roster reset");
+                    }
+                    // s/r only when not editing a name (collide with typing)
+                    KeyCode::Char('s') if !editing_name => {
+                        shuffle_in_place(&mut names);
+                        info!(event = "roster_reorder", action = "shuffle",
+                            via = "s", "roster shuffled");
+                    }
+                    KeyCode::Char('r') if !editing_name => {
+                        names.clone_from(&original_names);
+                        info!(event = "roster_reorder", action = "reset",
+                            via = "r", "roster reset");
+                    }
                     KeyCode::Tab | KeyCode::Down => field = next_field(field, names.len()),
                     KeyCode::BackTab | KeyCode::Up => field = prev_field(field, names.len()),
                     KeyCode::Enter => {
-                        // ENTER on a field advances; ENTER on last name commences
                         if let Field::Name(i) = field {
                             if i + 1 == names.len() { return Ok(()); }
                         }
                         field = next_field(field, names.len());
                     }
-                    KeyCode::F(2) => return Ok(()), // shortcut: commence now
                     KeyCode::Backspace => match field {
                         Field::Soldiers => { soldiers_buf.pop(); }
                         Field::Minutes => { minutes_buf.pop(); }
@@ -156,6 +200,11 @@ fn welcome_loop<W: Write>(out: &mut W, session: &mut Session) -> Result<()> {
                         }
                         Field::Name(i) if !c.is_control() && names[i].len() < 24 => {
                             names[i].push(c);
+                            // user is editing → record edit as the new "original"
+                            // for this slot so reset reflects the typed name
+                            if let Some(slot) = original_names.get_mut(i) {
+                                *slot = names[i].clone();
+                            }
                         }
                         _ => {}
                     },
@@ -163,6 +212,20 @@ fn welcome_loop<W: Write>(out: &mut W, session: &mut Session) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+fn shuffle_in_place(v: &mut [String]) {
+    // Fisher-Yates with a tiny LCG seeded from SystemTime.
+    let mut seed: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0xdead_beef);
+    for i in (1..v.len()).rev() {
+        // LCG step (Numerical Recipes constants)
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (seed >> 33) as usize % (i + 1);
+        v.swap(i, j);
     }
 }
 
@@ -204,7 +267,12 @@ fn draw_welcome<W: Write>(
     field_line(out, "  Soldiers in the boat (N)  : ", soldiers, field == Field::Soldiers, 4)?;
     field_line(out, "  Total daily duration (min): ", minutes, field == Field::Minutes, 4)?;
     queue!(out, Print("\r\n"))?;
-    queue!(out, SetForegroundColor(Color::DarkYellow), Print("  Roster:\r\n"), ResetColor)?;
+    queue!(
+        out,
+        SetForegroundColor(Color::DarkYellow),
+        Print("  Order of fire (1 = first to speak):\r\n"),
+        ResetColor
+    )?;
     for (i, name) in names.iter().enumerate() {
         let label = format!("    {:>2}.  ", i + 1);
         field_line(out, &label, name, field == Field::Name(i), 26)?;
@@ -218,7 +286,8 @@ fn draw_welcome<W: Write>(
         ResetColor,
         Print("\r\n"),
         SetForegroundColor(Color::DarkYellow),
-        Print("    [Tab/↑↓] move  [Enter] next  [Enter on last name / F2] COMMENCE  [Esc/Q] abort\r\n"),
+        Print("    [Tab/↑↓] move  [Enter] next  [F2] COMMENCE  [Esc] abort\r\n"),
+        Print("    [s / F5] shuffle order  [r / F6] reset  [Alt+↑/↓] move soldier\r\n"),
         ResetColor
     )?;
     out.flush()?;
@@ -240,13 +309,15 @@ fn field_line<W: Write>(out: &mut W, label: &str, value: &str, selected: bool, w
     Ok(())
 }
 
-// ─── Running screen ─────────────────────────────────────────────────────
+// ─── Running screen: big centered timer + landscape ────────────────────
 fn running_loop<W: Write>(out: &mut W, session: &mut Session, auto_advance: bool) -> Result<()> {
-    let mut last_tick = Instant::now();
-    let mut frame: u32 = 0;
+    let mut last_sec_tick = Instant::now();
+    let start = Instant::now();
+    let mut frame: u64 = 0;
 
     loop {
-        if event::poll(Duration::from_millis(120))? {
+        // input
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
                     match k.code {
@@ -259,105 +330,195 @@ fn running_loop<W: Write>(out: &mut W, session: &mut Session, auto_advance: bool
             }
         }
 
-        if last_tick.elapsed() >= Duration::from_secs(1) {
+        // 1-sec session tick
+        if last_sec_tick.elapsed() >= Duration::from_secs(1) {
             session.tick_one_second();
             telemetry::count_phase_second(session.phase());
-            last_tick = Instant::now();
+            last_sec_tick = Instant::now();
             let s = session.snapshot();
             telemetry::record(&s, &session.stats());
+            if s.total_elapsed > s.total_budget {
+                telemetry::count_cascade_second();
+            }
             if auto_advance && s.elapsed_current >= s.per_soldier_seconds {
                 session.next_soldier();
             }
         }
 
-        frame = frame.wrapping_add(1);
-        draw_running(out, session, frame)?;
+        // sub-tick render at ~5 fps (every 200 ms)
+        frame += 1;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let blink_500 = ((elapsed_ms / 500) % 2) as u8;
+        let blink_1000 = ((elapsed_ms / 1000) % 2) as u8;
+        draw_running(out, session, frame, blink_500, blink_1000, elapsed_ms)?;
 
         if matches!(session.phase(), Phase::Closing | Phase::Aborted) { break; }
+
+        std::thread::sleep(Duration::from_millis(180));
     }
     Ok(())
 }
 
-fn draw_running<W: Write>(out: &mut W, session: &Session, frame: u32) -> Result<()> {
+fn draw_running<W: Write>(
+    out: &mut W,
+    session: &Session,
+    frame: u64,
+    blink_500: u8,
+    blink_1000: u8,
+    elapsed_ms: u64,
+) -> Result<()> {
     let snap = session.snapshot();
-    let (cols, _) = terminal::size().unwrap_or((100, 30));
+    let (cols_u16, rows_u16) = terminal::size().unwrap_or((100, 30));
+    let cols = cols_u16 as usize;
+    let rows = rows_u16 as usize;
 
-    queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-    queue!(
-        out,
-        SetForegroundColor(Color::DarkYellow),
-        Print(format!(
-            "  ╔══════════════════════════════════════════════════════════╗\r\n  ║   D A I L Y   C O M M A N D O   —   {:>3}/{:<3} soldiers       ║\r\n  ╚══════════════════════════════════════════════════════════╝\r\n",
-            snap.current_soldier, snap.soldiers
-        )),
-        ResetColor
-    )?;
+    // ── Decide which font ASCII timer uses ────────────────────────────
+    let per = snap.per_soldier_seconds.max(1) as i32;
+    let elapsed_cur = snap.elapsed_current as i32;
+    let two_thirds = (per * 2) / 3;
+    let remaining = per - elapsed_cur;
+    let (font, color) = if remaining < 0 {
+        // overtime → blink every 0.5s
+        if blink_500 == 0 { (ascii_fonts::Font::Ok, Color::Red) } else { (ascii_fonts::Font::Ko, Color::DarkRed) }
+    } else if remaining <= 5 {
+        // critical → blink every 1s
+        if blink_1000 == 0 { (ascii_fonts::Font::Ok, Color::Red) } else { (ascii_fonts::Font::Ko, Color::Red) }
+    } else if elapsed_cur >= two_thirds {
+        (ascii_fonts::Font::Ko, Color::Yellow)
+    } else {
+        (ascii_fonts::Font::Ok, Color::Green)
+    };
 
-    let n = snap.soldiers as usize;
-    let spacing = ((cols as usize).saturating_sub(4) / n.max(1)).max(10);
-    let phase_step = ((frame / 4) % 2) as usize;
-    for line_idx in 0..5 {
-        queue!(out, Print("  "))?;
-        for i in 0..n {
-            let is_current = (i as u32) + 1 == snap.current_soldier;
-            let frame_lines = if (i + phase_step) % 2 == 0 { &FRAME_A } else { &FRAME_B };
-            let color = if is_current { Color::Yellow }
-                else if i < (snap.current_soldier as usize).saturating_sub(1) { Color::DarkGreen }
-                else { Color::DarkGrey };
-            queue!(out, SetForegroundColor(color),
-                Print(format!("{:width$}", frame_lines[line_idx], width = spacing)),
-                ResetColor)?;
+    // ── Build the "canvas" ───────────────────────────────────────────
+    // Start with a blank screen filled with spaces.
+    let mut canvas: Vec<Vec<char>> = vec![vec![' '; cols]; rows];
+    let mut color_map: Vec<Vec<Option<Color>>> = vec![vec![None; cols]; rows];
+
+    // Draw landscape (background, behind timer).
+    let world = landscape::WorldState::compute(
+        snap.total_elapsed,
+        snap.total_budget,
+        snap.soldiers,
+        snap.current_soldier,
+        cols,
+        rows,
+        elapsed_ms,
+    );
+    landscape::paint(&world, &mut canvas, &mut color_map);
+
+    // Big timer text (e.g. "1:23")
+    let (mins, secs) = if remaining >= 0 {
+        ((remaining / 60) as u32, (remaining % 60) as u32)
+    } else {
+        // when in overtime, show the absolute overtime with leading minus sign
+        let v = (-remaining) as u32;
+        (v / 60, v % 60)
+    };
+    let timer_str = format!("{}:{:02}", mins, secs);
+    let timer_lines = ascii_fonts::render_big(&timer_str, font);
+    let prefix = if remaining < 0 { Some('-') } else { None };
+
+    // Centered placement for the timer block (always on top).
+    let timer_w = timer_lines.iter().map(|l| l.chars().count()).max().unwrap_or(0)
+        + if prefix.is_some() { 4 } else { 0 };
+    let timer_h = timer_lines.len();
+    let start_x = cols.saturating_sub(timer_w) / 2;
+    let start_y = rows.saturating_sub(timer_h) / 2;
+    for (dy, line) in timer_lines.iter().enumerate() {
+        let y = start_y + dy;
+        if y >= rows { break; }
+        let mut x = start_x;
+        // overtime prefix '-' placed before the digits, on middle row
+        if let Some(c) = prefix {
+            if dy == timer_h / 2 {
+                if x < cols { canvas[y][x] = c; color_map[y][x] = Some(color); }
+            }
+            x += 4;
         }
-        queue!(out, Print("\r\n"))?;
+        for ch in line.chars() {
+            if x >= cols { break; }
+            if ch != ' ' {
+                canvas[y][x] = ch;
+                color_map[y][x] = Some(color);
+            }
+            x += 1;
+        }
     }
-    queue!(out, Print("  "))?;
-    for i in 0..n {
-        let is_current = (i as u32) + 1 == snap.current_soldier;
-        let color = if is_current { Color::Yellow } else { Color::DarkGrey };
-        let name = session.config().name_of(i as u32);
-        let truncated: String = name.chars().take(spacing.saturating_sub(2)).collect();
-        queue!(out, SetForegroundColor(color),
-            Print(format!("{:^width$}", truncated, width = spacing)),
-            ResetColor)?;
-    }
-    queue!(out, Print("\r\n\r\n"))?;
 
-    let rem = snap.remaining_current;
-    let (label, color) = if rem < 0 { ("OVERTIME", Color::Red) }
-        else if rem <= 10 { ("CRITICAL", Color::Red) }
-        else if rem <= 30 { ("WARNING ", Color::Yellow) }
-        else { ("ON TRACK", Color::Green) };
-    queue!(out, SetForegroundColor(color),
-        Print(format!("    ▶  {}  ({})   {}   [{}]\r\n",
-            snap.current_name, snap.current_soldier, fmt_signed(rem), label)),
-        ResetColor)?;
+    // Header line (top): "SOLDIER X / N — name"
+    let header = format!(
+        " D A I L Y   C O M M A N D O   —   {} ({}/{})   prep:{}",
+        snap.current_name, snap.current_soldier, snap.soldiers, fmt(snap.prep_seconds)
+    );
+    paint_string(&mut canvas, &mut color_map, 1, 0, &header, Color::DarkYellow);
 
-    let bar_w: usize = 50;
-    let frac = if snap.per_soldier_seconds == 0 { 0.0 }
-        else { (snap.elapsed_current as f32 / snap.per_soldier_seconds as f32).min(1.0) };
-    let filled = (bar_w as f32 * frac) as usize;
-    queue!(out,
-        Print("    ["),
-        SetForegroundColor(color),
-        Print("█".repeat(filled)),
-        ResetColor,
-        Print("·".repeat(bar_w - filled)),
-        Print(format!("]  total {} / {}\r\n\r\n", fmt(snap.total_elapsed), fmt(snap.total_budget)))
-    )?;
-
+    // Bottom line (controls)
     let phase_str = match snap.phase {
         Phase::Preparation => "PREP", Phase::Running => "RUNNING", Phase::Paused => "PAUSED",
         Phase::Closing => "CLOSING", Phase::Aborted => "ABORTED", Phase::Finished => "FINISHED",
     };
-    queue!(out,
-        SetForegroundColor(Color::DarkYellow),
-        Print(format!("    Phase: {}  prep:{}  closing:{}\r\n",
-            phase_str, fmt(snap.prep_seconds), fmt(snap.closing_seconds))),
-        Print("    [SPACE] pause   [N/→] next   [Q/ESC] abort\r\n"),
-        ResetColor
-    )?;
+    let footer = format!(
+        " phase:{}  total {} / {}   [SPACE] pause  [N/→] next  [Q/ESC] abort",
+        phase_str, fmt(snap.total_elapsed), fmt(snap.total_budget)
+    );
+    if rows >= 1 {
+        paint_string(&mut canvas, &mut color_map, 1, rows - 1, &footer, Color::DarkYellow);
+    }
+    let _ = frame; // unused; rendering driven by elapsed_ms
+
+    // ── Flush canvas to terminal ─────────────────────────────────────
+    queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+    for y in 0..rows {
+        let mut current_color: Option<Color> = None;
+        let mut buf = String::new();
+        for x in 0..cols {
+            let ch = canvas[y][x];
+            let c = color_map[y][x];
+            if c != current_color {
+                if !buf.is_empty() {
+                    write_colored(out, &buf, current_color)?;
+                    buf.clear();
+                }
+                current_color = c;
+            }
+            buf.push(ch);
+        }
+        if !buf.is_empty() {
+            write_colored(out, &buf, current_color)?;
+        }
+        if y + 1 < rows { queue!(out, Print("\r\n"))?; }
+    }
     out.flush()?;
     Ok(())
+}
+
+fn write_colored<W: Write>(out: &mut W, s: &str, c: Option<Color>) -> Result<()> {
+    if let Some(c) = c {
+        queue!(out, SetForegroundColor(c), Print(s), ResetColor)?;
+    } else {
+        queue!(out, Print(s))?;
+    }
+    Ok(())
+}
+
+fn paint_string(
+    canvas: &mut [Vec<char>],
+    colors: &mut [Vec<Option<Color>>],
+    x: usize,
+    y: usize,
+    s: &str,
+    color: Color,
+) {
+    if y >= canvas.len() { return; }
+    let row = &mut canvas[y];
+    let crow = &mut colors[y];
+    let mut xi = x;
+    for ch in s.chars() {
+        if xi >= row.len() { break; }
+        row[xi] = ch;
+        crow[xi] = Some(color);
+        xi += 1;
+    }
 }
 
 // ─── Closing screen ─────────────────────────────────────────────────────
@@ -426,11 +587,6 @@ fn draw_closing<W: Write>(out: &mut W, session: &Session) -> Result<()> {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 fn fmt(s: u32) -> String { format!("{}:{:02}", s / 60, s % 60) }
-fn fmt_signed(s: i32) -> String {
-    let sign = if s < 0 { "-" } else { " " };
-    let v = s.unsigned_abs();
-    format!("{}{}:{:02}", sign, v / 60, v % 60)
-}
 
 fn print_final_summary(session: &Session) {
     let snap = session.snapshot();

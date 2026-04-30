@@ -80,6 +80,36 @@ pub static CURRENT_SOLDIER: Lazy<Gauge> = Lazy::new(|| {
     m
 });
 
+pub static CASCADE_SECONDS: Lazy<IntCounter> = Lazy::new(|| {
+    let m = IntCounter::with_opts(Opts::new(
+        "cascade_seconds_total",
+        "Total seconds spent in the overtime cascade (act 2)",
+    ))
+    .unwrap();
+    REGISTRY.register(Box::new(m.clone())).ok();
+    m
+});
+
+pub static SATAN_REACHED: Lazy<Gauge> = Lazy::new(|| {
+    let m = Gauge::with_opts(Opts::new(
+        "satan_reached",
+        "1 when the boat has reached Satan (act 3 easter egg), 0 otherwise",
+    ))
+    .unwrap();
+    REGISTRY.register(Box::new(m.clone())).ok();
+    m
+});
+
+pub static SOLDIERS_BOARDED: Lazy<Gauge> = Lazy::new(|| {
+    let m = Gauge::with_opts(Opts::new(
+        "soldiers_boarded",
+        "Number of soldiers who have spoken (boarded the boat)",
+    ))
+    .unwrap();
+    REGISTRY.register(Box::new(m.clone())).ok();
+    m
+});
+
 /// Initialise tracing and start the Prometheus HTTP exporter on `port`.
 ///
 /// `json_logs = true` emits one JSON object per log record on **stderr**, so
@@ -91,6 +121,9 @@ pub fn init(port: u16, json_logs: bool) -> Result<()> {
     Lazy::force(&SOLDIER_SECONDS);
     Lazy::force(&OVERTIME_SECONDS);
     Lazy::force(&CURRENT_SOLDIER);
+    Lazy::force(&CASCADE_SECONDS);
+    Lazy::force(&SATAN_REACHED);
+    Lazy::force(&SOLDIERS_BOARDED);
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -161,6 +194,16 @@ pub fn record(snap: &crate::Tick, stats: &[crate::SoldierStats]) {
     CURRENT_SOLDIER.set(snap.current_soldier as f64);
     let overtime: u32 = stats.iter().map(|s| s.overtime_seconds).sum();
     OVERTIME_SECONDS.set(overtime as f64);
+    SOLDIERS_BOARDED.set(snap.current_soldier.saturating_sub(1) as f64);
+    let budget = snap.total_budget.max(1);
+    if snap.total_elapsed >= 2 * budget {
+        SATAN_REACHED.set(1.0);
+    }
+    if snap.total_elapsed > budget {
+        // each call counts at most 1 second; the running loop calls record()
+        // ≤ once per real second, so this stays a tight upper bound.
+        // We don't try to be exact: this is observability, not billing.
+    }
     for s in stats {
         SOLDIER_SECONDS
             .with_label_values(&[&s.index.to_string(), &s.name])
@@ -179,4 +222,10 @@ pub fn count_phase_second(phase: crate::Phase) {
         crate::Phase::Finished => "finished",
     };
     PHASE_SECONDS_TOTAL.with_label_values(&[label]).inc();
+}
+
+/// Increment the cascade-seconds counter (called once per real second when
+/// total_elapsed > total_budget).
+pub fn count_cascade_second() {
+    CASCADE_SECONDS.inc();
 }

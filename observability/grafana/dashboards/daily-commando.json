@@ -1,0 +1,94 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Phase seconds (running, paused, preparation, closing)",
+      "datasource": { "type": "prometheus", "uid": "VictoriaMetrics" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "rate(daily_commando_phase_seconds_total[1m])", "legendFormat": "{{phase}}" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Current soldier",
+      "datasource": { "type": "prometheus", "uid": "VictoriaMetrics" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "daily_commando_current_soldier_index" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Soldiers boarded",
+      "datasource": { "type": "prometheus", "uid": "VictoriaMetrics" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        { "expr": "daily_commando_soldiers_boarded" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-soldier seconds",
+      "datasource": { "type": "prometheus", "uid": "VictoriaMetrics" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "expr": "daily_commando_soldier_seconds", "legendFormat": "#{{index}} {{name}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Overtime (seconds)",
+      "datasource": { "type": "prometheus", "uid": "VictoriaMetrics" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "daily_commando_overtime_seconds" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Cascade seconds (overtime cumulative)",
+      "datasource": { "type": "prometheus", "uid": "VictoriaMetrics" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "daily_commando_cascade_seconds_total" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Satan reached (easter egg)",
+      "datasource": { "type": "prometheus", "uid": "VictoriaMetrics" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 12 },
+      "targets": [
+        { "expr": "daily_commando_satan_reached" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "calm" }, "1": { "text": "🔥 HELL 🔥" } } }
+          ]
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Sessions started",
+      "datasource": { "type": "prometheus", "uid": "VictoriaMetrics" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "daily_commando_sessions_total" }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["daily-commando"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "",
+  "title": "Daily Commando — Mission Control",
+  "uid": "daily-commando",
+  "version": 1
+}
