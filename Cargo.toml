@@ -1,7 +1,7 @@
 [package]
 name = "daily-commando"
 version = "0.1.0"
-edition = "2021"
+edition = "2026"
 description = "A minimalist daily standup timer in commando style"
 license = "EUPL-1.2"
 repository = "https://github.com/robinsft/daily-commando"
