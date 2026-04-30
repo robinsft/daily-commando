@@ -58,6 +58,12 @@ pub struct Tick {
     pub soldiers: u32,
     pub per_soldier_seconds: u32,
     pub elapsed_current: u32,
+    /// Allowance (signed) for the current speaker = nominal_per + cumulative
+    /// savings/overshoots from already-completed speakers. May be negative if
+    /// previous speakers consumed everything.
+    pub current_allowance: i32,
+    /// `current_allowance - elapsed_current`. Negative when the speaker is
+    /// over their allowance.
     pub remaining_current: i32,
     pub total_elapsed: u32,
     pub total_budget: u32,
@@ -161,10 +167,27 @@ impl Session {
         }
     }
 
+    /// Allowance for the speaker at `idx` (0-based) given the pool model:
+    /// nominal_per + sum_{j<idx}(per - elapsed[j]).
+    pub fn allowance_for(&self, idx: u32) -> i32 {
+        let per = self.config.per_soldier_seconds() as i32;
+        let mut a = per;
+        for j in 0..(idx as usize).min(self.elapsed.len()) {
+            a += per - self.elapsed[j] as i32;
+        }
+        a
+    }
+
+    /// Allowance for the currently-speaking soldier.
+    pub fn current_allowance(&self) -> i32 {
+        self.allowance_for(self.current)
+    }
+
     pub fn snapshot(&self) -> Tick {
         let per = self.config.per_soldier_seconds();
         let elapsed_current = *self.elapsed.get(self.current as usize).unwrap_or(&0);
         let total_elapsed: u32 = self.elapsed.iter().sum();
+        let allowance = self.current_allowance();
         Tick {
             phase: self.phase,
             current_soldier: self.current + 1,
@@ -172,7 +195,8 @@ impl Session {
             soldiers: self.config.soldiers,
             per_soldier_seconds: per,
             elapsed_current,
-            remaining_current: per as i32 - elapsed_current as i32,
+            current_allowance: allowance,
+            remaining_current: allowance - elapsed_current as i32,
             total_elapsed,
             total_budget: self.config.total_seconds,
             prep_seconds: self.prep_seconds,
@@ -260,6 +284,26 @@ mod tests {
         for _ in 0..15 { s.tick_one_second(); }
         let stats = s.stats();
         assert_eq!(stats[0].overtime_seconds, 5);
+    }
+
+    #[test]
+    fn allowance_pool_rolls_savings_and_overshoots() {
+        // 3 soldiers, 30s total → per=10s
+        let mut s = Session::new(cfg(3, 30));
+        s.commence();
+        // soldier 1 uses only 4s → saves 6s
+        for _ in 0..4 { s.tick_one_second(); }
+        s.next_soldier();
+        // soldier 2 allowance should now be 10 + (10-4) = 16
+        assert_eq!(s.current_allowance(), 16);
+        let snap = s.snapshot();
+        assert_eq!(snap.current_allowance, 16);
+        assert_eq!(snap.remaining_current, 16);
+        // soldier 2 uses 20s → overshoot 4
+        for _ in 0..20 { s.tick_one_second(); }
+        s.next_soldier();
+        // soldier 3 allowance = 10 + (10-4) + (10-20) = 6
+        assert_eq!(s.current_allowance(), 6);
     }
 
     #[test]
