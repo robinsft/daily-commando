@@ -13,7 +13,7 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use daily_commando::{ascii_fonts, landscape, telemetry, Phase, Session, SessionConfig};
+use daily_commando::{ascii_fonts, landscape, telemetry, Phase, Session, SessionConfig, Tick};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 use tracing::{info, info_span};
@@ -315,7 +315,8 @@ fn field_line<W: Write>(out: &mut W, label: &str, value: &str, selected: bool, w
 enum Anim {
     /// Pressing `n` early: the next island is being dragged TOWARD the boat
     /// over `ANCHOR_FRAMES` frames at ~25 fps. On completion, advances.
-    AnchorPull { frame: u8, started: Instant, stop_index: usize, last: bool },
+    AnchorPull { frame: u8, started: Instant, stop_index: usize, last: bool,
+                 soldier_name: String, was_early: bool },
     /// Last speaker hands over while still in budget: castle is dragged in,
     /// flag rises, fireworks burst. On completion, calls `session.close()`.
     MarioVictory { frame: u8, started: Instant },
@@ -396,6 +397,10 @@ fn running_loop<W: Write>(out: &mut W, session: &mut Session, _auto_advance: boo
     // Latched once total > budget — boat falls, mission report waits for user.
     let mut cascade_active = false;
     let mut renderer = DiffRenderer::new();
+    // Islands that are done: stay visible as landmarks with colored flags.
+    let mut settled_islands: Vec<landscape::SettledIsland> = Vec::new();
+    // Track last rendered world state to grab island positions on transition.
+    let mut last_world: Option<landscape::WorldState> = None;
 
     loop {
         // ── Input ─────────────────────────────────────────────────────
@@ -434,10 +439,13 @@ fn running_loop<W: Write>(out: &mut W, session: &mut Session, _auto_advance: boo
                                     started: Instant::now(),
                                     stop_index: snap.current_soldier as usize,
                                     last,
+                                    soldier_name: snap.current_name.clone(),
+                                    was_early: true,
                                 });
                             } else {
                                 // Boat already at (or past) destination — towed
-                                // island just gets boarded immediately.
+                                // island just gets boarded immediately. Settle it.
+                                settle_island(&mut settled_islands, &last_world, &snap, false);
                                 session.next_soldier();
                             }
                         }
@@ -471,9 +479,19 @@ fn running_loop<W: Write>(out: &mut W, session: &mut Session, _auto_advance: boo
         let mut next_anim = anim.clone();
         if let Some(a) = anim.as_ref() {
             match a {
-                Anim::AnchorPull { started, .. } => {
+                Anim::AnchorPull { started, stop_index, soldier_name, was_early, .. } => {
                     let f = (started.elapsed().as_millis() as u64 / ANIM_FRAME_MS) as u8;
                     if f >= ANCHOR_FRAMES {
+                        // Settle the island at its final pulled position.
+                        let final_x = last_world.as_ref().map(|w| {
+                            let idx = stop_index.saturating_sub(1);
+                            w.islands.get(idx).map(|i| i.x).unwrap_or(0)
+                        }).unwrap_or(0);
+                        settled_islands.push(landscape::SettledIsland {
+                            x: final_x,
+                            was_early: *was_early,
+                            name: soldier_name.clone(),
+                        });
                         session.next_soldier();
                         next_anim = None;
                     } else if let Some(Anim::AnchorPull { frame, .. }) = next_anim.as_mut() {
@@ -499,14 +517,32 @@ fn running_loop<W: Write>(out: &mut W, session: &mut Session, _auto_advance: boo
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let blink_500 = ((elapsed_ms / 500) % 2) as u8;
         let blink_1000 = ((elapsed_ms / 1000) % 2) as u8;
-        draw_running(out, &mut renderer, session, frame, blink_500, blink_1000, elapsed_ms,
-                     cascade_active, anim.as_ref())?;
+        last_world = Some(draw_running(out, &mut renderer, session, frame, blink_500, blink_1000,
+                                       elapsed_ms, cascade_active, anim.as_ref(), &settled_islands)?);
 
         if matches!(session.phase(), Phase::Closing | Phase::Aborted) && !cascade_active { break; }
 
         std::thread::sleep(Duration::from_millis(ANIM_FRAME_MS));
     }
     Ok(())
+}
+
+/// Record a settled island from the last world state when a soldier boards.
+fn settle_island(
+    settled: &mut Vec<landscape::SettledIsland>,
+    last_world: &Option<landscape::WorldState>,
+    snap: &Tick,
+    was_early: bool,
+) {
+    let island_idx = (snap.current_soldier as usize).saturating_sub(1);
+    let x = last_world.as_ref()
+        .and_then(|w| w.islands.get(island_idx).map(|i| i.x))
+        .unwrap_or(0);
+    settled.push(landscape::SettledIsland {
+        x,
+        was_early,
+        name: snap.current_name.clone(),
+    });
 }
 
 fn draw_running<W: Write>(
@@ -519,7 +555,8 @@ fn draw_running<W: Write>(
     elapsed_ms: u64,
     cascade_active: bool,
     anim: Option<&Anim>,
-) -> Result<()> {
+    settled_islands: &[landscape::SettledIsland],
+) -> Result<landscape::WorldState> {
     let snap = session.snapshot();
     let (cols_u16, rows_u16) = terminal::size().unwrap_or((100, 30));
     let cols = cols_u16 as usize;
@@ -563,6 +600,7 @@ fn draw_running<W: Write>(
         current_allowance: snap.current_allowance,
         cols, rows, elapsed_ms,
         anchor_pull,
+        settled: settled_islands.to_vec(),
     });
     landscape::paint(&world, &mut canvas, &mut color_map);
 
@@ -636,7 +674,7 @@ fn draw_running<W: Write>(
 
     // ── Diff flush ───────────────────────────────────────────────────
     renderer.render(out, &canvas, &color_map)?;
-    Ok(())
+    Ok(world)
 }
 
 // ─── Mario victory overlay ─────────────────────────────────────────────

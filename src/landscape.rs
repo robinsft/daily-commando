@@ -37,6 +37,8 @@ pub struct WorldState {
     pub stops: Vec<usize>,
     /// Per-island state (length `N - 1`).
     pub islands: Vec<IslandState>,
+    /// Islands that are done — permanent landmarks with colored flags.
+    pub settled: Vec<SettledIsland>,
     pub current_soldier: u32,
     pub soldiers: u32,
     pub castle_x: usize,
@@ -85,6 +87,9 @@ pub struct Inputs {
     /// Override: current speaker has hit "next" early; the destination
     /// island is being pulled toward the boat over `pull_progress` 0..1.
     pub anchor_pull: Option<AnchorPull>,
+    /// Islands that are done (soldier boarded) — kept in the landscape with
+    /// a colored flag showing the soldier's name.
+    pub settled: Vec<SettledIsland>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +98,18 @@ pub struct AnchorPull {
     pub stop_index: usize,
     /// 0.0 = at original position, 1.0 = at boat.
     pub progress: f32,
+}
+
+/// An island that has been "consumed" (its soldier boarded) and now sits
+/// permanently in the decor as a landmark with a colored flag.
+#[derive(Debug, Clone)]
+pub struct SettledIsland {
+    /// Final x position where the island stopped.
+    pub x: usize,
+    /// True if the soldier handed over early (flag = green), false if late (red).
+    pub was_early: bool,
+    /// Soldier name displayed on the flag.
+    pub name: String,
 }
 
 impl WorldState {
@@ -235,6 +252,7 @@ impl WorldState {
             cols, rows, act, satan_stage, sun_x,
             boat_x, boat_y, boat_rotation, boat_wrecked,
             horizon_y, stops, islands,
+            settled: inp.settled.clone(),
             current_soldier: inp.current_soldier, soldiers: inp.soldiers,
             castle_x, castle_w, castle_state, cascade_x,
         }
@@ -272,6 +290,28 @@ pub fn paint(
 
     // Islands (Voyage only)
     if matches!(w.act, Act::Voyage) {
+        // Draw settled (consumed) islands first — they're background landmarks.
+        for si in &w.settled {
+            paint_island(canvas, colors, si.x, w.horizon_y, 0);
+            // Flag pole + colored flag with soldier name
+            if w.horizon_y >= 5 {
+                let pole_x = si.x;
+                let flag_color = if si.was_early { Color::Green } else { Color::Red };
+                // Pole
+                place(canvas, colors, pole_x, w.horizon_y - 5, '|', Color::White);
+                place(canvas, colors, pole_x, w.horizon_y - 6, '|', Color::White);
+                // Flag (name, max 4 chars, to the right of the pole)
+                let label: String = si.name.chars().take(4).collect();
+                for (i, ch) in label.chars().enumerate() {
+                    let fx = pole_x + 1 + i;
+                    if fx < w.cols {
+                        place(canvas, colors, fx, w.horizon_y - 6, ch, flag_color);
+                    }
+                }
+            }
+        }
+
+        // Active (not-yet-consumed) islands.
         for (k, isl) in w.islands.iter().enumerate() {
             if isl.consumed { continue; }
             paint_island(canvas, colors, isl.x, w.horizon_y, isl.tilt);
@@ -568,6 +608,7 @@ mod tests {
             current_soldier: current, elapsed_current: elapsed,
             current_allowance: 20, cols: 80, rows: 24, elapsed_ms: 0,
             anchor_pull: ap,
+            settled: vec![],
         })
     }
 
